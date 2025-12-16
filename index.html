@@ -108,6 +108,31 @@
 			color: var(--muted);
 			font-size: 0.9rem;
 		}
+
+		#screenOverlay {
+			position: fixed;
+			top: 0;
+			left: 0;
+			width: 100vw;
+			height: 100vh;
+			background: black;
+			opacity: 0;
+			pointer-events: none;
+			z-index: 9998;
+		}
+
+		#bgVideo {
+			position: fixed;
+			top: 0;
+			left: 0;
+			width: 100vw;
+			height: 100vh;
+			object-fit: cover;
+			background: black;
+			opacity: 0;
+			z-index: 9999;
+			pointer-events: none;
+		}
 	</style>
 </head>
 <body>
@@ -124,8 +149,17 @@
 		</div>
 
 		<section class="inputs-grid" id="inputsGrid"></section>
-		<button id="submitBtn" type="button" style="margin-top: 16px; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--border); background: var(--accent); color: #0b1221; font-weight: 700; cursor: pointer;">Submit</button>
+		<div style="display: grid; gap: 10px; margin-top: 16px; grid-template-columns: 1fr auto; align-items: end;">
+			<label style="display: grid; gap: 6px; color: var(--muted); font-size: 0.9rem;">
+				ElevenLabs API Key
+				<input id="apiKey"  placeholder="sk_..." style="padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: #0c1323; color: var(--text);" />
+			</label>
+			<button id="submitBtn" type="button" style="padding: 12px 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--accent); color: #0b1221; font-weight: 700; cursor: pointer;">Generate & Play</button>
+		</div>
 	</main>
+
+	<div id="screenOverlay"></div>
+	<video id="bgVideo" muted playsinline preload="metadata" src="video.mp4"></video>
 
 	<script>
 		const allowedValues = [1, 2, 4, 8, 16, 32, 64];
@@ -133,6 +167,20 @@
 		const valuePill = document.getElementById('valuePill');
 		const inputsGrid = document.getElementById('inputsGrid');
 		const submitBtn = document.getElementById('submitBtn');
+		const apiKeyInput = document.getElementById('apiKey');
+		const voiceIdInput = document.getElementById('voiceId');
+		const backingTrack = new Audio('audio.mp3');
+		const bgVideo = document.getElementById('bgVideo');
+		const screenOverlay = document.getElementById('screenOverlay');
+		const LOOP_START = 18.35;
+		const LOOP_END = 38;
+		const VIDEO_FADE_IN = 10.35;
+		const VIDEO_LOOP_START = 16;
+		const VIDEO_LOOP_END = 28;
+		const SCREEN_FADE_DURATION = 1; // seconds
+		const PRE_START_DELAY = 2; // seconds before audio/video start to begin screen fade
+
+		const defaultVoice = '21m00Tcm4TlvDq8ikWAM'; // ElevenLabs default (Rachel)
 
 		slider.max = allowedValues.length - 1;
 
@@ -198,7 +246,11 @@
 				for (let i = 0; i < current.length; i += 2) {
 					const a = current[i];
 					const b = current[i + 1];
-					lines.push(`I have a ${fmtOut(a)}, I have a ${fmtOut(b)}.`);
+                    if (a.length === 1) {
+                        lines.push(`I have a ${fmtOut(a)}, I have a ${fmtOut(b)}.`);
+                    } else {
+                        lines.push(`${fmtOut(a)}, ${fmtOut(b)}.`);
+                    }
 					const combined = swap([...a, ...b]);
 					lines.push(`Uh! ${fmtOut(combined)}!`);
 					lines.push('');
@@ -211,10 +263,242 @@
 			return lines.join('\n').replace(/\n$/, '');
 		};
 
+		const playAudioFromText = async (text) => {
+			const apiKey = apiKeyInput.value.trim();
+			const voiceId = 'pNInz6obpgDQGcFmaJgB';
+
+			if (!apiKey) {
+				alert('Please enter your ElevenLabs API key.');
+				return;
+			}
+
+			submitBtn.disabled = true;
+			submitBtn.textContent = 'Generating...';
+
+			try {
+				const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						'xi-api-key': apiKey,
+						Accept: 'audio/mpeg',
+					},
+					body: JSON.stringify({
+						text,
+						model_id: 'eleven_multilingual_v2',
+					}),
+				});
+
+				if (!res.ok) {
+					const msg = await res.text();
+					throw new Error(`TTS failed: ${res.status} ${msg}`);
+				}
+
+				const blob = await res.blob();
+				const url = URL.createObjectURL(blob);
+				const ttsAudio = new Audio(url);
+
+				let lyricsStarted = false;
+				let ttsDone = false;
+				let fadeOutStarted = false;
+				let videoSeeking = false;
+				let screenFadedOut = false;
+				let fadeInId = null;
+				let fadeOutId = null;
+				let screenFadeId = null;
+				let fadeOutDuration = null;
+				let fadeOutStart = null;
+
+				const teardown = () => {
+					backingTrack.removeEventListener('timeupdate', onTimeUpdate);
+					ttsAudio.removeEventListener('ended', onTtsEnded);
+					bgVideo.removeEventListener('timeupdate', onVideoTimeUpdate);
+					bgVideo.removeEventListener('ended', onVideoEnded);
+					bgVideo.removeEventListener('seeked', onVideoSeeked);
+					if (fadeInId) cancelAnimationFrame(fadeInId);
+					if (fadeOutId) cancelAnimationFrame(fadeOutId);
+					if (screenFadeId) cancelAnimationFrame(screenFadeId);
+				};
+
+				// Fade screen to black (cubic ease-in)
+				const fadeScreenToBlack = (callback) => {
+					const start = performance.now();
+					const step = (now) => {
+						const elapsed = (now - start) / 1000;
+						const linear = Math.min(1, elapsed / SCREEN_FADE_DURATION);
+						const progress = Math.pow(linear, 3);
+						screenOverlay.style.opacity = progress.toFixed(3);
+						if (linear < 1) {
+							screenFadeId = requestAnimationFrame(step);
+						} else {
+							screenFadedOut = true;
+							if (callback) callback();
+						}
+					};
+					screenFadeId = requestAnimationFrame(step);
+				};
+
+				// Fade screen back in from black (cubic ease-out)
+				const fadeScreenFromBlack = () => {
+					const start = performance.now();
+					const step = (now) => {
+						const elapsed = (now - start) / 1000;
+						const linear = Math.min(1, elapsed / SCREEN_FADE_DURATION);
+						const progress = 1 - Math.pow(1 - linear, 3);
+						screenOverlay.style.opacity = (1 - progress).toFixed(3);
+						if (linear < 1) {
+							screenFadeId = requestAnimationFrame(step);
+						} else {
+							screenOverlay.style.opacity = '0';
+						}
+					};
+					screenFadeId = requestAnimationFrame(step);
+				};
+
+				const startFadeIn = () => {
+					const start = performance.now();
+					const step = (now) => {
+						const elapsed = (now - start) / 1000;
+						const linear = Math.min(1, elapsed / VIDEO_FADE_IN);
+						// Exponential ease-in: slow start, fast finish
+						const progress = Math.pow(linear, 3);
+						bgVideo.style.opacity = progress.toFixed(3);
+						if (progress < 1) {
+							fadeInId = requestAnimationFrame(step);
+						}
+					};
+					fadeInId = requestAnimationFrame(step);
+				};
+
+				const startFadeOut = () => {
+					if (fadeOutStarted) return;
+					fadeOutStarted = true;
+					if (fadeOutId) cancelAnimationFrame(fadeOutId);
+					const start = fadeOutStart ?? performance.now();
+					const duration = fadeOutDuration ?? 1.5;
+					const initialOpacity = parseFloat(bgVideo.style.opacity || '1');
+					const step = (now) => {
+						const elapsed = (now - start) / 1000;
+						const progress = Math.min(1, elapsed / duration);
+						const next = Math.max(0, initialOpacity * (1 - progress));
+						bgVideo.style.opacity = next.toFixed(3);
+						if (progress < 1) {
+							fadeOutId = requestAnimationFrame(step);
+						} else {
+							bgVideo.pause();
+							// Wait 1 second then fade screen back in
+							setTimeout(() => {
+								fadeScreenFromBlack();
+							}, 1000);
+						}
+					};
+					fadeOutId = requestAnimationFrame(step);
+				};
+
+				const onTtsEnded = () => {
+					ttsDone = true;
+					fadeOutStart = performance.now();
+					const remaining = Math.max(0.1, LOOP_END - backingTrack.currentTime);
+					fadeOutDuration = remaining;
+					startFadeOut();
+				};
+
+				const onTimeUpdate = () => {
+					if (!lyricsStarted && backingTrack.currentTime >= LOOP_START) {
+						lyricsStarted = true;
+						ttsAudio.play().catch((err) => {
+							console.error(err);
+						});
+					}
+
+					if (backingTrack.currentTime >= LOOP_END - 0.05) {
+						if (ttsDone) {
+							backingTrack.pause();
+							teardown();
+							startFadeOut();
+						} else {
+							backingTrack.currentTime = LOOP_START;
+						}
+					}
+				};
+
+				const onBackingStarted = () => {
+					// Start screen fade to black immediately (1 second duration)
+					// After 1 second (when screen is black), start video
+					fadeScreenToBlack(() => {
+						const startVideo = () => {
+							bgVideo.currentTime = VIDEO_LOOP_START + 0.01;
+							bgVideo.play().catch((err) => console.error(err));
+							startFadeIn();
+						};
+						if (bgVideo.readyState >= 1) {
+							startVideo();
+						} else {
+							bgVideo.load();
+							bgVideo.addEventListener('loadedmetadata', startVideo, { once: true });
+						}
+					});
+				};
+
+				const loopVideo = () => {
+					if (videoSeeking || fadeOutStarted) return;
+					videoSeeking = true;
+					bgVideo.currentTime = VIDEO_LOOP_START;
+				};
+
+				const onVideoSeeked = () => {
+					videoSeeking = false;
+					if (!fadeOutStarted && bgVideo.paused) {
+						bgVideo.play().catch((err) => console.error(err));
+					}
+				};
+
+				const onVideoTimeUpdate = () => {
+					if (bgVideo.currentTime >= VIDEO_LOOP_END - 0.1) {
+						loopVideo();
+					}
+				};
+
+				const onVideoEnded = () => {
+					loopVideo();
+				};
+
+				const startBacking = () => {
+					// Start audio 2 seconds earlier to allow for screen fade before video starts
+					backingTrack.currentTime = 8 - PRE_START_DELAY;
+					backingTrack.addEventListener('timeupdate', onTimeUpdate);
+					ttsAudio.addEventListener('ended', onTtsEnded);
+					bgVideo.addEventListener('timeupdate', onVideoTimeUpdate);
+					bgVideo.addEventListener('ended', onVideoEnded);
+					bgVideo.addEventListener('seeked', onVideoSeeked);
+					backingTrack.addEventListener('playing', onBackingStarted, { once: true });
+					backingTrack.play().catch((err) => {
+						console.error(err);
+						teardown();
+					});
+				};
+
+				if (backingTrack.readyState >= 1) {
+					startBacking();
+				} else {
+					backingTrack.addEventListener('loadedmetadata', startBacking, { once: true });
+				}
+
+			} catch (err) {
+				console.error(err);
+				alert(err.message || 'Failed to generate audio.');
+			} finally {
+				submitBtn.disabled = false;
+				submitBtn.textContent = 'Generate & Play';
+			}
+		};
+
 		submitBtn.addEventListener('click', () => {
 			const values = Array.from(inputsGrid.querySelectorAll('input')).map((input) => input.value);
 			const lyrics = buildPPAPLyrics(values);
-			alert(lyrics);
+			console.log(`Script length: ${lyrics.length}`);
+			console.log('Script contents:\n' + lyrics);
+			playAudioFromText(lyrics);
 		});
 
 		// Initialize UI.
