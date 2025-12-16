@@ -260,12 +260,21 @@
 			}
 
 			lines.push(`${fmtOut(current[0])}!`);
+			
+			// Add the first letter of each item in the final amalgamation at the beginning
+			const firstLetters = current[0].map(item => item.charAt(0).toUpperCase()).join(' ');
+			lines.unshift('');
+			lines.unshift('...');
+			lines.unshift('');
+			lines.unshift(firstLetters);
+			lines.unshift('');
+			
 			return lines.join('\n').replace(/\n$/, '');
 		};
 
 		const playAudioFromText = async (text) => {
 			const apiKey = apiKeyInput.value.trim();
-			const voiceId = 'pNInz6obpgDQGcFmaJgB';
+			const voiceId = '4dYr4XZ8Ps3eiY72xYf8';
 
 			if (!apiKey) {
 				alert('Please enter your ElevenLabs API key.');
@@ -414,8 +423,9 @@
 					if (backingTrack.currentTime >= LOOP_END - 0.05) {
 						if (ttsDone) {
 							backingTrack.pause();
-							teardown();
-							startFadeOut();
+							if (!fadeOutStarted) {
+								startFadeOut();
+							}
 						} else {
 							backingTrack.currentTime = LOOP_START;
 						}
